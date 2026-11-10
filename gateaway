@@ -1,0 +1,214 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <DHTesp.h>
+#include <ArduinoJson.h>
+
+// Definisi Pin Sensor
+const int PIN_DHT = 15;
+const int PIN_TRIG = 5;
+const int PIN_ECHO = 18;
+const int PIN_GAS_ANALOG = 34;
+const int PIN_LED_STATUS = 2; // LED Indikator Status / Gateway Heartbeat
+
+// Inisialisasi Objek Sensor
+DHTesp dhtSensor;
+
+// Konfigurasi Jaringan Virtual Wokwi & MQTT Broker
+const char* ssid = "Wokwi-GUEST";
+const char* password = "";
+const char* mqtt_server = "broker.emqx.io";
+const int mqtt_port = 1883;
+const char* mqtt_topic = "muhammad/iot/pertemuan7/gateway";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// Konfigurasi Siklus Gateway IoT
+const unsigned long SAMPLING_INTERVAL = 1000;     // Baca sensor lokal setiap 1 detik
+const unsigned long GATEWAY_PUSH_INTERVAL = 5000; // Agregasi & kirim ke cloud tiap 5 detik
+unsigned long lastSampleTime = 0;
+unsigned long lastPushTime = 0;
+
+// Konfigurasi Alarm Overflow Seketika (Edge Threshold)
+const float TANK_OVERFLOW_THRESHOLD_CM = 10.0;  // Jarak < 10 cm = tangki penuh
+const unsigned long ALARM_COOLDOWN = 2000;      // Jeda minimal antar alarm (ms)
+unsigned long lastAlarmTime = 0;
+bool alarmEverSent = false;                     // Penanda alarm pertama
+
+// Variabel Penampung Edge Processing (Agregasi Data)
+float sumTemperature = 0.0;
+float sumHumidity = 0.0;
+float sumDistance = 0.0;
+float sumGasLevel = 0.0;
+int sampleCount = 0;
+
+// Fungsi Koneksi Ulang MQTT
+void reconnectMQTT() {
+  while (!client.connected()) {
+    Serial.print("Menghubungkan ke MQTT Broker (EMQX)... ");
+    String clientId = "ESP32Gateway-" + String(random(0xffff), HEX);
+    if (client.connect(clientId.c_str())) {
+      Serial.println("TERHUBUNG!");
+    } else {
+      Serial.print("Gagal, rc=");
+      Serial.print(client.state());
+      Serial.println(" Mencoba lagi dalam 2 detik...");
+      delay(2000);
+    }
+  }
+}
+
+// Fungsi Pembacaan Sensor Jarak Ultrasonik (HC-SR04)
+float readUltrasonicDistanceCM() {
+  digitalWrite(PIN_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+
+  long duration = pulseIn(PIN_ECHO, HIGH, 30000); // Timeout 30ms
+  if (duration == 0) return -1.0; // Deteksi out-of-range
+  return duration * 0.034 / 2;
+}
+
+// Fungsi Pembacaan Potensiometer sebagai Simulasi Sensor Gas (0 - 100%)
+float readSimulatedGasLevel() {
+  int rawADC = analogRead(PIN_GAS_ANALOG);
+  return (rawADC / 4095.0) * 100.0;
+}
+
+// Fungsi Publish Telemetri (dipakai siklus 5 detik DAN alarm seketika)
+void publishTelemetry(const char* status, float temp, float hum,
+                      float dist, float gas, int samples) {
+  StaticJsonDocument<384> jsonDoc;
+  jsonDoc["gateway_id"] = "GW-INFORMATIKA-07";
+  jsonDoc["uptime_sec"] = millis() / 1000;
+  jsonDoc["status"] = status;
+  jsonDoc["samples_aggregated"] = samples;
+
+  JsonObject telemetry = jsonDoc.createNestedObject("telemetry_avg");
+  telemetry["temperature_c"]    = serialized(String(temp, 2));
+  telemetry["humidity_pct"]     = serialized(String(hum, 2));
+  telemetry["tank_distance_cm"] = serialized(String(dist, 2));
+  telemetry["gas_level_pct"]    = serialized(String(gas, 2));
+
+  String jsonOutput;
+  serializeJsonPretty(jsonDoc, jsonOutput);
+
+  Serial.println("\n--------------------------------------------------");
+  Serial.printf(">>> [GATEWAY UPLINK] STATUS: %s <<<\n", status);
+  Serial.println(jsonOutput);
+  Serial.println("--------------------------------------------------\n");
+
+  bool success = client.publish(mqtt_topic, jsonOutput.c_str());
+  if (success) {
+    Serial.printf(">>> [MQTT PUBLISH BERHASIL] Data terkirim ke topik: %s\n", mqtt_topic);
+  } else {
+    Serial.println(">>> [MQTT PUBLISH GAGAL] Ukuran payload melebihi buffer atau client terputus!");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n=============================================");
+  Serial.println(">>> INISIALISASI IOT GATEWAY PERTEMUAN 7 <<<");
+  Serial.println("=============================================");
+
+  // Inisialisasi Pinout
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+  dhtSensor.setup(PIN_DHT, DHTesp::DHT22);
+  pinMode(PIN_LED_STATUS, OUTPUT);
+
+  // Koneksi ke Jaringan Gateway Wi-Fi
+  Serial.print("Menghubungkan ke Wi-Fi Gateway: ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println("\n[GATEWAY ONLINE] IP Address Gateway: " + WiFi.localIP().toString());
+  Serial.println("Gateway siap melakukan agregasi dan transmisi data telemetri.\n");
+  digitalWrite(PIN_LED_STATUS, HIGH); // Indikator Gateway aktif dan online
+
+  // Konfigurasi MQTT Server
+  client.setServer(mqtt_server, mqtt_port);
+  client.setBufferSize(512); // Perbesar buffer MQTT dari default 128 byte
+}
+
+void loop() {
+  if (!client.connected()) {
+    reconnectMQTT();
+  }
+  client.loop();
+
+  unsigned long currentMillis = millis();
+
+  // TAHAP 1: DATA COLLECTION (setiap 1 detik)
+  if (currentMillis - lastSampleTime >= SAMPLING_INTERVAL) {
+    lastSampleTime = currentMillis;
+
+    TempAndHumidity dhtData = dhtSensor.getTempAndHumidity();
+    float currentDistance = readUltrasonicDistanceCM();
+    float currentGas = readSimulatedGasLevel();
+
+    // Data Filtering: validasi data sebelum ditampung
+    if (!isnan(dhtData.temperature) && !isnan(dhtData.humidity) && currentDistance >= 0) {
+      sumTemperature += dhtData.temperature;
+      sumHumidity += dhtData.humidity;
+      sumDistance += currentDistance;
+      sumGasLevel += currentGas;
+      sampleCount++;
+
+      Serial.printf("[EDGE SAMPLING #%d] Suhu: %.1f C | Hum: %.1f %% | Jarak: %.1f cm | Gas: %.1f %%\n",
+                    sampleCount, dhtData.temperature, dhtData.humidity, currentDistance, currentGas);
+
+      // EDGE ALARM SEKETIKA: tangki penuh (jarak < 10 cm), tanpa menunggu 5 detik
+      if (currentDistance < TANK_OVERFLOW_THRESHOLD_CM &&
+          (!alarmEverSent || (currentMillis - lastAlarmTime >= ALARM_COOLDOWN))) {
+        lastAlarmTime = currentMillis;
+        alarmEverSent = true;
+        Serial.println("!!! [EDGE ALARM] TANK_OVERFLOW TERDETEKSI - KIRIM SEKETIKA !!!");
+        publishTelemetry("TANK_OVERFLOW", dhtData.temperature, dhtData.humidity,
+                         currentDistance, currentGas, 1);
+      }
+
+      // Heartbeat blink menandakan aktivitas pembacaan sensor
+      digitalWrite(PIN_LED_STATUS, LOW);
+      delay(50);
+      digitalWrite(PIN_LED_STATUS, HIGH);
+    }
+  }
+
+  // TAHAP 2 & 3: EDGE PROCESSING & GATEWAY PUSH (setiap 5 detik)
+  if (currentMillis - lastPushTime >= GATEWAY_PUSH_INTERVAL) {
+    lastPushTime = currentMillis;
+
+    if (sampleCount > 0) {
+      // Hitung nilai rata-rata dari buffer lokal
+      float avgTemp = sumTemperature / sampleCount;
+      float avgHum  = sumHumidity / sampleCount;
+      float avgDist = sumDistance / sampleCount;
+      float avgGas  = sumGasLevel / sampleCount;
+
+      // Prioritas status: TANK_OVERFLOW > ALERT_CRITICAL > NORMAL
+      const char* systemStatus = "NORMAL";
+      if (avgDist < TANK_OVERFLOW_THRESHOLD_CM) {
+        systemStatus = "TANK_OVERFLOW";
+      } else if (avgTemp > 45.0 || avgGas > 75.0) {
+        systemStatus = "ALERT_CRITICAL";
+      }
+
+      // TAHAP 4: SERIALISASI JSON & MQTT PUBLISH
+      publishTelemetry(systemStatus, avgTemp, avgHum, avgDist, avgGas, sampleCount);
+
+      // Reset buffer agregasi
+      sumTemperature = 0.0;
+      sumHumidity = 0.0;
+      sumDistance = 0.0;
+      sumGasLevel = 0.0;
+      sampleCount = 0;
+    }
+  }
+}
